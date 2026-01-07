@@ -1,0 +1,23 @@
+# Environment
+.venv/
+.conda/
+
+# Python
+__pycache__/
+.ipynb_checkpoints/
+
+# Data
+*.csv
+*.xlsx
+
+# Model & artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+indobert-sentiment/
+indobert-sentiment-tiktok/
+
+# OS
+.DS_Store
+Thumbs.db
