@@ -3,7 +3,13 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import altair as alt
+
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# BERTopic stack
+from bertopic import BERTopic
+from sentence_transformers import SentenceTransformer
+
 
 # ======================================================
 # KONFIGURASI HALAMAN
@@ -15,7 +21,7 @@ st.set_page_config(
 )
 
 # ======================================================
-# SESSION STATE (BIAR TIDAK RESET KETIKA GANTI RADIO)
+# SESSION STATE (AGAR HASIL TIDAK RESET)
 # ======================================================
 if "df_labeled" not in st.session_state:
     st.session_state.df_labeled = None
@@ -25,6 +31,12 @@ if "analysis_done" not in st.session_state:
 
 if "text_column" not in st.session_state:
     st.session_state.text_column = None
+
+# Simpan hasil BERTopic per sentimen
+if "bertopic_results" not in st.session_state:
+    # format:
+    # st.session_state.bertopic_results["Negatif"] = {"df_topics":..., "topic_info":..., "top_topic":..., "top_n":...}
+    st.session_state.bertopic_results = {}
 
 # ======================================================
 # SIDEBAR
@@ -74,9 +86,9 @@ st.markdown(
 st.write("")
 
 # ======================================================
-# LOAD MODEL INDOBERT (CACHE BIAR CEPAT)
+# LOAD MODEL INDOBERT (CACHE)
 # ======================================================
-MODEL_PATH = "./indobert-sentiment-tiktok"
+MODEL_PATH = "./indobert-sentiment-tiktok"  # sesuaikan
 device = torch.device("cpu")
 
 
@@ -91,7 +103,6 @@ def load_indobert(model_path: str):
 
 with st.spinner("🔄 Memuat model IndoBERT..."):
     tokenizer, model = load_indobert(MODEL_PATH)
-
 st.success("✅ Model IndoBERT siap digunakan")
 
 label_map = {0: "Negatif", 1: "Positif"}
@@ -113,18 +124,21 @@ def predict_sentiment(text: str):
 
 
 # ======================================================
-# LOAD HASIL BERTOPIC (NEGATIF & POSITIF)
+# LOAD MODEL BERTOPIC (CACHE)
 # ======================================================
-@st.cache_data
-def load_bertopic_outputs():
-    # Pastikan file-file ini ada di folder output/
-    df_neg = pd.read_csv("output/hasil_bertopic_negatif_tiktok.csv")
-    info_neg = pd.read_csv("output/topic_info_negatif_tiktok.csv")
-
-    df_pos = pd.read_csv("output/hasil_bertopic_positif_tiktok.csv")
-    info_pos = pd.read_csv("output/topic_info_positif_tiktok.csv")
-
-    return (df_neg, info_neg), (df_pos, info_pos)
+@st.cache_resource
+def load_bertopic():
+    # Embedding multilingual (bagus untuk Indonesia)
+    embedding_model = SentenceTransformer(
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+    topic_model = BERTopic(
+        embedding_model=embedding_model,
+        language="multilingual",
+        calculate_probabilities=False,
+        verbose=False,
+    )
+    return topic_model
 
 
 # ======================================================
@@ -155,7 +169,7 @@ with c2:
 st.markdown("---")
 
 # ======================================================
-# TOMBOL ANALISIS (HANYA SEKALI, HASIL DISIMPAN DI SESSION)
+# TOMBOL ANALISIS INDO BERT
 # ======================================================
 if st.button("🚀 Jalankan Analisis Sentimen (IndoBERT)", use_container_width=True):
     sentiment_labels = []
@@ -173,14 +187,16 @@ if st.button("🚀 Jalankan Analisis Sentimen (IndoBERT)", use_container_width=T
     df_result["sentiment_label"] = sentiment_labels
     df_result["confidence"] = confidence_scores
 
-    # ✅ simpan supaya tidak hilang saat UI berubah
     st.session_state.df_labeled = df_result
     st.session_state.analysis_done = True
+
+    # Reset hasil BERTopic jika dataset diganti / analisis ulang
+    st.session_state.bertopic_results = {}
 
     st.success("🎉 Analisis sentimen selesai dan disimpan!")
 
 # ======================================================
-# JIKA BELUM ANALISIS, STOP DI SINI
+# STOP JIKA BELUM INDO BERT
 # ======================================================
 if not st.session_state.analysis_done or st.session_state.df_labeled is None:
     st.warning("Klik tombol **Jalankan Analisis Sentimen (IndoBERT)** terlebih dahulu.")
@@ -195,7 +211,7 @@ st.markdown("## 📊 Hasil Analisis Sentimen (IndoBERT)")
 st.dataframe(df_result.head(), use_container_width=True)
 
 # ======================================================
-# DISTRIBUSI SENTIMEN (ALTAIR: NEGATIF MERAH, POSITIF HIJAU)
+# DISTRIBUSI SENTIMEN
 # ======================================================
 st.markdown("### 📈 Distribusi Sentimen")
 
@@ -215,8 +231,7 @@ chart = (
         color=alt.Color(
             "Sentimen:N",
             scale=alt.Scale(
-                domain=["Negatif", "Positif"],
-                range=["#e74c3c", "#2ecc71"],
+                domain=["Negatif", "Positif"], range=["#e74c3c", "#2ecc71"]
             ),
             legend=None,
         ),
@@ -224,11 +239,10 @@ chart = (
     )
     .properties(height=360)
 )
-
 st.altair_chart(chart, use_container_width=True)
 
 # ======================================================
-# DOWNLOAD HASIL INDO BERT (DI BAGIAN SENTIMEN, BUKAN BERTOPIC)
+# DOWNLOAD HASIL INDO BERT
 # ======================================================
 result_csv = df_result.to_csv(index=False).encode("utf-8")
 st.download_button(
@@ -242,10 +256,9 @@ st.download_button(
 st.markdown("---")
 
 # ======================================================
-# PILIH SENTIMEN UNTUK TOPIK (TIDAK RESET!)
+# PILIH SENTIMEN UNTUK TOPIK
 # ======================================================
 st.markdown("## 🎯 Pilih Sentimen untuk Analisis Topik")
-
 selected_sentiment = st.radio(
     "Analisis topik berdasarkan sentimen:",
     ["Negatif", "Positif"],
@@ -253,46 +266,105 @@ selected_sentiment = st.radio(
 )
 
 # ======================================================
-# ANALISIS TOPIK (BERTOPIC) - LOAD CSV HASIL NOTEBOOK
+# PROSES BERTOPIC LANGSUNG DI STREAMLIT
 # ======================================================
 st.markdown("## 🧠 Analisis Topik Dominan (BERTopic)")
 
-try:
-    (df_neg, info_neg), (df_pos, info_pos) = load_bertopic_outputs()
-except Exception as e:
-    st.error(
-        "File output BERTopic belum ditemukan / salah path.\n\n"
-        "Pastikan ada file berikut di folder `output/`:\n"
-        "- hasil_bertopic_negatif_tiktok.csv\n"
-        "- topic_info_negatif_tiktok.csv\n"
-        "- hasil_bertopic_positif_tiktok.csv\n"
-        "- topic_info_positif_tiktok.csv\n\n"
-        f"Detail error: {e}"
+# Ambil subset data sesuai sentimen
+subset = df_result[df_result["sentiment_label"] == selected_sentiment].copy()
+subset_texts = subset[st.session_state.text_column].dropna().astype(str).tolist()
+
+if len(subset_texts) < 10:
+    st.warning(
+        f"Data untuk sentimen **{selected_sentiment}** terlalu sedikit ({len(subset_texts)}). "
+        "Minimal disarankan >= 10 teks agar topik lebih stabil."
+    )
+
+colA, colB, colC = st.columns([1.2, 1, 1], gap="medium")
+
+with colA:
+    st.write("**Ringkasan Data Sentimen Terpilih**")
+    st.metric("Jumlah teks", len(subset_texts))
+
+with colB:
+    min_topic_size = st.number_input(
+        "min_topic_size", min_value=2, max_value=200, value=15, step=1
+    )
+
+with colC:
+    nr_topics_opt = st.selectbox(
+        "nr_topics (opsional)", ["auto", 5, 10, 15, 20, 30], index=0
+    )
+
+run_topic = st.button(
+    "🧠 Jalankan BERTopic untuk Sentimen Terpilih", use_container_width=True
+)
+
+
+def run_bertopic_for_sentiment(texts, min_topic_size, nr_topics_opt):
+    topic_model = load_bertopic()
+
+    # Set parameter runtime (BERTopic object bisa dipakai, tapi param lebih aman dibuat ulang)
+    # Agar simple, kita buat model baru dengan embedding_model yang sama.
+    embedding_model = topic_model.embedding_model
+    nr_topics_val = nr_topics_opt if nr_topics_opt != "auto" else "auto"
+
+    model_runtime = BERTopic(
+        embedding_model=embedding_model,
+        language="multilingual",
+        calculate_probabilities=False,
+        verbose=False,
+        min_topic_size=int(min_topic_size),
+        nr_topics=nr_topics_val,
+    )
+
+    topics, _ = model_runtime.fit_transform(texts)
+    df_topics = pd.DataFrame({"text": texts, "topic": topics})
+    topic_info = model_runtime.get_topic_info()
+
+    # Topik dominan (kecuali -1 jika ada)
+    counts = df_topics["topic"].value_counts()
+    if -1 in counts.index and len(counts) > 1:
+        counts = counts.drop(index=-1)
+
+    top_topic = int(counts.idxmax()) if len(counts) else -1
+    top_n = int(counts.loc[top_topic]) if top_topic in counts.index else 0
+
+    return df_topics, topic_info, top_topic, top_n
+
+
+# Jalankan BERTopic hanya jika diminta atau sudah ada hasil di session_state
+if run_topic:
+    if len(subset_texts) == 0:
+        st.error("Tidak ada teks untuk diproses. Pastikan kolom teks tidak kosong.")
+        st.stop()
+
+    with st.spinner(f"🔄 Memproses BERTopic untuk sentimen {selected_sentiment}..."):
+        df_topics, topic_info, top_topic, top_n = run_bertopic_for_sentiment(
+            subset_texts, min_topic_size, nr_topics_opt
+        )
+
+    st.session_state.bertopic_results[selected_sentiment] = {
+        "df_topics": df_topics,
+        "topic_info": topic_info,
+        "top_topic": top_topic,
+        "top_n": top_n,
+    }
+
+    st.success(f"✅ BERTopic selesai diproses untuk sentimen {selected_sentiment}.")
+
+# Jika belum pernah diproses untuk sentimen ini
+if selected_sentiment not in st.session_state.bertopic_results:
+    st.info(
+        "Klik tombol **Jalankan BERTopic** untuk memproses topik pada sentimen terpilih."
     )
     st.stop()
 
-if selected_sentiment == "Negatif":
-    df_topics = df_neg
-    topic_info = info_neg
-else:
-    df_topics = df_pos
-    topic_info = info_pos
-
-# Pastikan kolom penting ada
-required_cols = {"topic"}
-if not required_cols.issubset(set(df_topics.columns)):
-    st.error(
-        f"CSV BERTopic harus memiliki kolom: {required_cols}. Kolom saat ini: {list(df_topics.columns)}"
-    )
-    st.stop()
-
-# Ambil topik dominan (yang count paling besar, selain -1 jika ada)
-topic_counts = df_topics["topic"].value_counts()
-if -1 in topic_counts.index and len(topic_counts) > 1:
-    topic_counts = topic_counts.drop(index=-1)
-
-topik_dominan = int(topic_counts.idxmax())
-jumlah_topik = int(topic_counts.loc[topik_dominan])
+# Ambil hasil dari session_state
+df_topics = st.session_state.bertopic_results[selected_sentiment]["df_topics"]
+topic_info = st.session_state.bertopic_results[selected_sentiment]["topic_info"]
+topik_dominan = st.session_state.bertopic_results[selected_sentiment]["top_topic"]
+jumlah_topik = st.session_state.bertopic_results[selected_sentiment]["top_n"]
 
 badge_color = "#1f3b2c" if selected_sentiment == "Negatif" else "#143a2a"
 st.markdown(
@@ -317,11 +389,11 @@ st.markdown(
 )
 
 # ======================================================
-# KATA KUNCI TOPIK
+# KATA KUNCI TOPIK DOMINAN
 # ======================================================
-st.markdown("### 🔑 Kata Kunci Topik")
+st.markdown("### 🔑 Kata Kunci Topik (Dominan)")
 
-# Beberapa versi topic_info pakai kolom "Topic" atau "topic"
+# BERTopic topic_info biasanya punya kolom: Topic, Count, Name, Representation
 topic_col = (
     "Topic"
     if "Topic" in topic_info.columns
@@ -349,32 +421,70 @@ else:
         )
 
 # ======================================================
-# CONTOH KOMENTAR (ambil dari kolom teks yang tersedia di df_topics)
+# CONTOH KOMENTAR TOPIK DOMINAN
 # ======================================================
-st.markdown("### 💬 Contoh Komentar")
+st.markdown("### 💬 Contoh Komentar (Topik Dominan)")
 
-# pilih kolom teks terbaik yang tersedia
-candidate_text_cols = ["cleaning", "normalisasi", "comment", "text", "review"]
-text_col_in_topics = next(
-    (c for c in candidate_text_cols if c in df_topics.columns), None
+contoh = (
+    df_topics[df_topics["topic"] == topik_dominan]["text"]
+    .dropna()
+    .astype(str)
+    .head(5)
+    .tolist()
+)
+if not contoh:
+    st.info("Tidak ada contoh komentar untuk topik ini.")
+else:
+    for i, teks in enumerate(contoh, 1):
+        st.write(f"{i}. {teks}")
+
+# ======================================================
+# DISTRIBUSI TOPIK (TOP 10)
+# ======================================================
+st.markdown("### 📊 Distribusi Topik (Top 10)")
+
+topic_counts = df_topics["topic"].value_counts().reset_index()
+topic_counts.columns = ["Topic", "Jumlah"]
+topic_counts["Topic"] = topic_counts["Topic"].astype(int)
+
+# opsional: buang outlier -1 agar chart lebih informatif
+topic_counts_no_outlier = topic_counts[topic_counts["Topic"] != -1].copy()
+if len(topic_counts_no_outlier) > 0:
+    plot_df = topic_counts_no_outlier.head(10)
+else:
+    plot_df = topic_counts.head(10)
+
+topic_chart = (
+    alt.Chart(plot_df)
+    .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+    .encode(
+        x=alt.X("Topic:O", sort="-y", title="Topic"),
+        y=alt.Y("Jumlah:Q", title="Jumlah Teks"),
+        tooltip=["Topic", "Jumlah"],
+    )
+    .properties(height=320)
+)
+st.altair_chart(topic_chart, use_container_width=True)
+
+# ======================================================
+# DOWNLOAD HASIL BERTOPIC
+# ======================================================
+st.markdown("### ⬇️ Download Hasil BERTopic")
+
+csv_topics = df_topics.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label=f"Download df_topics ({selected_sentiment})",
+    data=csv_topics,
+    file_name=f"hasil_bertopic_{selected_sentiment.lower()}.csv",
+    mime="text/csv",
+    use_container_width=True,
 )
 
-if text_col_in_topics is None:
-    st.info(
-        "Tidak menemukan kolom teks pada CSV hasil BERTopic.\n"
-        f"Kolom tersedia: {list(df_topics.columns)}\n"
-        "Minimal salah satu dari: cleaning / normalisasi / comment / text / review"
-    )
-else:
-    contoh = (
-        df_topics[df_topics["topic"] == topik_dominan][text_col_in_topics]
-        .dropna()
-        .astype(str)
-        .head(5)
-        .tolist()
-    )
-    if not contoh:
-        st.info("Tidak ada contoh komentar untuk topik ini.")
-    else:
-        for i, teks in enumerate(contoh, 1):
-            st.write(f"{i}. {teks}")
+csv_info = topic_info.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label=f"Download topic_info ({selected_sentiment})",
+    data=csv_info,
+    file_name=f"topic_info_{selected_sentiment.lower()}.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
