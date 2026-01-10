@@ -10,6 +10,10 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from bertopic import BERTopic
 from sentence_transformers import SentenceTransformer
 
+# Evaluasi metrik
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
 
 # ======================================================
 # KONFIGURASI HALAMAN
@@ -34,8 +38,6 @@ if "text_column" not in st.session_state:
 
 # Simpan hasil BERTopic per sentimen
 if "bertopic_results" not in st.session_state:
-    # format:
-    # st.session_state.bertopic_results["Negatif"] = {"df_topics":..., "topic_info":..., "top_topic":..., "top_n":...}
     st.session_state.bertopic_results = {}
 
 # ======================================================
@@ -128,7 +130,6 @@ def predict_sentiment(text: str):
 # ======================================================
 @st.cache_resource
 def load_bertopic():
-    # Embedding multilingual (bagus untuk Indonesia)
     embedding_model = SentenceTransformer(
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
@@ -142,12 +143,13 @@ def load_bertopic():
 
 
 # ======================================================
-# UPLOAD DATASET
+# UPLOAD DATASET UTAMA (UNLABELED)
 # ======================================================
-st.markdown("## 📁 Upload Dataset")
+st.markdown("## 📁 Upload Dataset Utama")
 uploaded_file = st.file_uploader(
     "Upload file CSV (dataset tanpa label sentimen)",
     type=["csv"],
+    key="main_dataset",
 )
 
 if uploaded_file is None:
@@ -163,7 +165,7 @@ with c1:
 
 with c2:
     st.markdown("### ⚙️ Pengaturan")
-    text_column = st.selectbox("Pilih kolom teks", df.columns)
+    text_column = st.selectbox("Pilih kolom teks", df.columns, key="text_col_main")
     st.session_state.text_column = text_column
 
 st.markdown("---")
@@ -211,34 +213,60 @@ st.markdown("## 📊 Hasil Analisis Sentimen (IndoBERT)")
 st.dataframe(df_result.head(), use_container_width=True)
 
 # ======================================================
-# DISTRIBUSI SENTIMEN
+# DISTRIBUSI SENTIMEN (BAR + LABEL ANGKA + AXIS BOLD)
 # ======================================================
 st.markdown("### 📈 Distribusi Sentimen")
 
 sentiment_df = df_result["sentiment_label"].value_counts().reset_index()
 sentiment_df.columns = ["Sentimen", "Jumlah"]
 
-chart = (
+bars = (
     alt.Chart(sentiment_df)
     .mark_bar(cornerRadiusTopLeft=8, cornerRadiusTopRight=8)
     .encode(
         x=alt.X(
             "Sentimen:N",
-            sort=["Negatif", "Positif"],
-            axis=alt.Axis(labelAngle=0, title="Kategori Sentimen"),
+            sort=["Positif", "Negatif"],  # 🔁 URUTAN DIBALIK
+            axis=alt.Axis(
+                labelAngle=0,
+                title="Kategori Sentimen",
+                labelFontSize=14,
+                labelFontWeight="bold",
+            ),
         ),
         y=alt.Y("Jumlah:Q", title="Jumlah Data"),
         color=alt.Color(
             "Sentimen:N",
             scale=alt.Scale(
-                domain=["Negatif", "Positif"], range=["#e74c3c", "#2ecc71"]
+                domain=["Positif", "Negatif"],  # 🔁 WARNA IKUT URUTAN
+                range=["#2ecc71", "#e74c3c"],  # hijau = positif, merah = negatif
             ),
             legend=None,
         ),
-        tooltip=["Sentimen", "Jumlah"],
+        tooltip=[
+            alt.Tooltip("Sentimen:N", title="Sentimen"),
+            alt.Tooltip("Jumlah:Q", title="Jumlah Data"),
+        ],
     )
-    .properties(height=360)
 )
+
+labels = (
+    alt.Chart(sentiment_df)
+    .mark_text(
+        dy=-8,
+        size=14,
+        color="white",
+        fontWeight="bold",
+    )
+    .encode(
+        x=alt.X("Sentimen:N", sort=["Positif", "Negatif"]),  # 🔁 SAMA DENGAN BAR
+        y=alt.Y("Jumlah:Q"),
+        text=alt.Text("Jumlah:Q"),
+    )
+)
+
+chart = (bars + labels).properties(height=360)
+
 st.altair_chart(chart, use_container_width=True)
 
 # ======================================================
@@ -256,56 +284,262 @@ st.download_button(
 st.markdown("---")
 
 # ======================================================
-# PILIH SENTIMEN UNTUK TOPIK
+# EVALUASI MODEL – ANOTASI MANUAL SENTIMEN (UI IMPROVED)
 # ======================================================
-st.markdown("## 🎯 Pilih Sentimen untuk Analisis Topik")
+st.markdown("## ✍️ Anotasi Manual Sentimen")
+st.caption(
+    "Berikan label sentimen berdasarkan **interpretasi manusia**, "
+    "bukan mengikuti hasil IndoBERT. "
+    "Bagian ini digunakan untuk mengevaluasi kinerja model."
+)
+
+# -----------------------------
+# Pengaturan sampling
+# -----------------------------
+sample_size = st.slider(
+    "Jumlah data untuk evaluasi manual",
+    min_value=10,
+    max_value=min(200, len(df_result)),
+    value=50,
+    step=10,
+)
+
+if "eval_sample_df" not in st.session_state:
+    st.session_state.eval_sample_df = None
+
+if st.button("🎯 Ambil Sampel Evaluasi", use_container_width=True):
+    st.session_state.eval_sample_df = df_result.sample(
+        sample_size, random_state=42
+    ).reset_index(drop=True)
+    st.success(f"{sample_size} data berhasil diambil untuk anotasi manual.")
+
+# -----------------------------
+# TAMPILAN ANOTASI
+# -----------------------------
+if st.session_state.eval_sample_df is not None:
+    eval_df = st.session_state.eval_sample_df.copy()
+    manual_labels = []
+
+    st.markdown("### 📝 Form Anotasi Sentimen")
+
+    for i, row in eval_df.iterrows():
+        st.markdown(
+            f"""
+            <div style="
+                padding: 1rem;
+                border-radius: 12px;
+                background: #111827;
+                border: 1px solid #1f2937;
+                margin-bottom: 1rem;
+            ">
+                <b>{i+1}.</b> {row[st.session_state.text_column]}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        label = st.radio(
+            "Pilih label sentimen:",
+            ["Positif", "Negatif"],  # POSITIF DULU
+            key=f"manual_label_{i}",
+            horizontal=True,
+        )
+
+        manual_labels.append(label)
+
+    # -----------------------------
+    # HITUNG EVALUASI
+    # -----------------------------
+    if st.button("📊 Hitung Akurasi & Evaluasi Manual", use_container_width=True):
+        eval_df["manual_label"] = manual_labels
+
+        y_true = eval_df["manual_label"]
+        y_pred = eval_df["sentiment_label"]
+
+        acc = accuracy_score(y_true, y_pred)
+
+        # ======================================================
+        # CLASSIFICATION REPORT (TAMPILAN RAPI & PROFESIONAL)
+        # ======================================================
+        st.markdown("### 📋 Classification Report")
+
+        report_dict = classification_report(
+            y_true,
+            y_pred,
+            labels=["Positif", "Negatif"],
+            output_dict=True,
+        )
+
+        df_report = pd.DataFrame(report_dict).transpose()
+
+        # Rename kolom agar rapi
+        df_report = df_report.rename(
+            columns={
+                "precision": "Precision",
+                "recall": "Recall",
+                "f1-score": "F1-Score",
+                "support": "Support",
+            }
+        )
+
+        # Bulatkan angka
+        df_report = df_report.round(2)
+
+        # Pisahkan kelas & ringkasan
+        df_class = df_report.loc[["Positif", "Negatif"]]
+        df_summary = df_report.loc[["accuracy", "macro avg", "weighted avg"]]
+
+        # -----------------------------
+        # METRIC UTAMA (CARD)
+        # -----------------------------
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Accuracy",
+                f"{df_summary.loc['accuracy', 'Precision'] * 100:.2f}%",
+            )
+
+        with col2:
+            st.metric(
+                "Macro F1-Score",
+                f"{df_summary.loc['macro avg', 'F1-Score']:.2f}",
+            )
+
+        with col3:
+            st.metric(
+                "Weighted F1-Score",
+                f"{df_summary.loc['weighted avg', 'F1-Score']:.2f}",
+            )
+
+        # -----------------------------
+        # TABEL DETAIL PER KELAS
+        # -----------------------------
+        st.markdown("#### 📊 Detail Kinerja per Kelas")
+        st.dataframe(
+            df_class[["Precision", "Recall", "F1-Score", "Support"]],
+            use_container_width=True,
+        )
+
+        # -----------------------------
+        # TABEL RINGKASAN
+        # -----------------------------
+        st.markdown("#### 📌 Ringkasan Model")
+        st.dataframe(
+            df_summary[["Precision", "Recall", "F1-Score", "Support"]],
+            use_container_width=True,
+        )
+
+        # -----------------------------
+        # DOWNLOAD HASIL ANOTASI
+        # -----------------------------
+        st.markdown("### ⬇️ Unduh Hasil Anotasi Manual")
+        eval_csv = eval_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download hasil evaluasi manual",
+            eval_csv,
+            file_name="evaluasi_manual_sentimen.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+st.markdown("---")
+
+# ======================================================
+# PILIH SENTIMEN UNTUK ANALISIS TOPIK (UI IMPROVED)
+# ======================================================
+st.markdown(
+    """
+    <div style="
+        padding: 1.2rem 1.4rem;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #0e1117, #151a22);
+        border: 1px solid #262730;
+        margin-bottom: 1rem;
+    ">
+        <h3 style="margin:0;">🎯 Pilih Sentimen untuk Analisis Topik</h3>
+        <p style="margin-top:0.4rem; color:#b0b3b8;">
+            Analisis topik dilakukan berdasarkan hasil klasifikasi sentimen IndoBERT.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 selected_sentiment = st.radio(
-    "Analisis topik berdasarkan sentimen:",
-    ["Negatif", "Positif"],
+    "Sentimen yang dianalisis:",
+    ["Positif", "Negatif"],  # ✅ POSITIF DULU
     horizontal=True,
 )
 
 # ======================================================
-# PROSES BERTOPIC LANGSUNG DI STREAMLIT
+# ANALISIS TOPIK DOMINAN (BERTOPIC)
 # ======================================================
-st.markdown("## 🧠 Analisis Topik Dominan (BERTopic)")
+st.markdown(
+    """
+    <div style="
+        padding: 1.2rem 1.4rem;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #0e1117, #151a22);
+        border: 1px solid #262730;
+        margin-bottom: 1rem;
+    ">
+        <h3 style="margin:0;">🧠 Analisis Topik Dominan (BERTopic)</h3>
+        <p style="margin-top:0.4rem; color:#b0b3b8;">
+            Mengidentifikasi isu utama dari kumpulan teks berdasarkan sentimen terpilih.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Ambil subset data sesuai sentimen
 subset = df_result[df_result["sentiment_label"] == selected_sentiment].copy()
 subset_texts = subset[st.session_state.text_column].dropna().astype(str).tolist()
 
 if len(subset_texts) < 10:
     st.warning(
-        f"Data untuk sentimen **{selected_sentiment}** terlalu sedikit ({len(subset_texts)}). "
-        "Minimal disarankan >= 10 teks agar topik lebih stabil."
+        f"Jumlah data untuk sentimen **{selected_sentiment}** hanya {len(subset_texts)}. "
+        "Minimal disarankan ≥ 10 teks agar topik lebih stabil."
     )
 
-colA, colB, colC = st.columns([1.2, 1, 1], gap="medium")
+# ------------------------------------------------------
+# PANEL PENGATURAN
+# ------------------------------------------------------
+colA, colB, colC = st.columns([1.3, 1, 1], gap="medium")
 
 with colA:
-    st.write("**Ringkasan Data Sentimen Terpilih**")
-    st.metric("Jumlah teks", len(subset_texts))
+    st.markdown("**📌 Ringkasan Data**")
+    st.metric("Jumlah Teks", len(subset_texts))
 
 with colB:
     min_topic_size = st.number_input(
-        "min_topic_size", min_value=2, max_value=200, value=15, step=1
+        "min_topic_size",
+        min_value=2,
+        max_value=200,
+        value=15,
+        step=1,
+        help="Ukuran minimum dokumen dalam satu topik",
     )
 
 with colC:
     nr_topics_opt = st.selectbox(
-        "nr_topics (opsional)", ["auto", 5, 10, 15, 20, 30], index=0
+        "nr_topics (opsional)",
+        ["auto", 5, 10, 15, 20, 30],
+        index=0,
+        help="Jumlah topik akhir (auto = otomatis)",
     )
 
 run_topic = st.button(
-    "🧠 Jalankan BERTopic untuk Sentimen Terpilih", use_container_width=True
+    "🚀 Jalankan BERTopic",
+    use_container_width=True,
 )
 
 
+# ======================================================
+# FUNGSI BERTOPIC
+# ======================================================
 def run_bertopic_for_sentiment(texts, min_topic_size, nr_topics_opt):
     topic_model = load_bertopic()
-
-    # Set parameter runtime (BERTopic object bisa dipakai, tapi param lebih aman dibuat ulang)
-    # Agar simple, kita buat model baru dengan embedding_model yang sama.
     embedding_model = topic_model.embedding_model
     nr_topics_val = nr_topics_opt if nr_topics_opt != "auto" else "auto"
 
@@ -322,7 +556,6 @@ def run_bertopic_for_sentiment(texts, min_topic_size, nr_topics_opt):
     df_topics = pd.DataFrame({"text": texts, "topic": topics})
     topic_info = model_runtime.get_topic_info()
 
-    # Topik dominan (kecuali -1 jika ada)
     counts = df_topics["topic"].value_counts()
     if -1 in counts.index and len(counts) > 1:
         counts = counts.drop(index=-1)
@@ -333,10 +566,12 @@ def run_bertopic_for_sentiment(texts, min_topic_size, nr_topics_opt):
     return df_topics, topic_info, top_topic, top_n
 
 
-# Jalankan BERTopic hanya jika diminta atau sudah ada hasil di session_state
+# ======================================================
+# JALANKAN BERTOPIC
+# ======================================================
 if run_topic:
     if len(subset_texts) == 0:
-        st.error("Tidak ada teks untuk diproses. Pastikan kolom teks tidak kosong.")
+        st.error("Tidak ada teks untuk diproses.")
         st.stop()
 
     with st.spinner(f"🔄 Memproses BERTopic untuk sentimen {selected_sentiment}..."):
@@ -351,37 +586,34 @@ if run_topic:
         "top_n": top_n,
     }
 
-    st.success(f"✅ BERTopic selesai diproses untuk sentimen {selected_sentiment}.")
+    st.success(f"✅ BERTopic selesai untuk sentimen {selected_sentiment}.")
 
-# Jika belum pernah diproses untuk sentimen ini
 if selected_sentiment not in st.session_state.bertopic_results:
-    st.info(
-        "Klik tombol **Jalankan BERTopic** untuk memproses topik pada sentimen terpilih."
-    )
+    st.info("Klik tombol **Jalankan BERTopic** untuk melihat hasil analisis topik.")
     st.stop()
 
-# Ambil hasil dari session_state
+# ======================================================
+# HASIL TOPIK DOMINAN
+# ======================================================
 df_topics = st.session_state.bertopic_results[selected_sentiment]["df_topics"]
 topic_info = st.session_state.bertopic_results[selected_sentiment]["topic_info"]
 topik_dominan = st.session_state.bertopic_results[selected_sentiment]["top_topic"]
 jumlah_topik = st.session_state.bertopic_results[selected_sentiment]["top_n"]
 
-badge_color = "#1f3b2c" if selected_sentiment == "Negatif" else "#143a2a"
+badge_color = "#143a2a" if selected_sentiment == "Positif" else "#3a1f1f"
+
 st.markdown(
     f"""
     <div style="
-        padding: 0.9rem 1rem;
-        border-radius: 10px;
+        padding: 1rem 1.2rem;
+        border-radius: 12px;
         background: {badge_color};
         border: 1px solid #2a3b2f;
-        margin-top: 0.4rem;
+        margin-top: 1rem;
     ">
-        <span style="font-size: 1rem;">🎯</span>
-        <b style="margin-left: 0.4rem;">
-            Topik Dominan Sentimen {selected_sentiment}: Topic {topik_dominan}
-        </b>
-        <span style="color:#b0b3b8; margin-left: 0.6rem;">
-            (n={jumlah_topik})
+        <b>🎯 Topik Dominan Sentimen {selected_sentiment}</b><br>
+        <span style="color:#d1d5db;">
+            Topic {topik_dominan} (n={jumlah_topik})
         </span>
     </div>
     """,
@@ -389,57 +621,26 @@ st.markdown(
 )
 
 # ======================================================
-# KATA KUNCI TOPIK DOMINAN
+# KATA KUNCI TOPIK
 # ======================================================
-st.markdown("### 🔑 Kata Kunci Topik (Dominan)")
+st.markdown("### 🔑 Kata Kunci Topik Dominan")
 
-# BERTopic topic_info biasanya punya kolom: Topic, Count, Name, Representation
-topic_col = (
-    "Topic"
-    if "Topic" in topic_info.columns
-    else ("topic" if "topic" in topic_info.columns else None)
-)
+topic_col = "Topic" if "Topic" in topic_info.columns else "topic"
 repr_col = (
-    "Representation"
-    if "Representation" in topic_info.columns
-    else ("representation" if "representation" in topic_info.columns else None)
+    "Representation" if "Representation" in topic_info.columns else "representation"
 )
 
-if topic_col is None or repr_col is None:
-    st.warning(
-        "Kolom topic_info tidak sesuai standar.\n"
-        f"Kolom yang ada: {list(topic_info.columns)}\n"
-        "Pastikan topic_info punya kolom `Topic` dan `Representation`."
+info_row = topic_info[topic_info[topic_col] == topik_dominan]
+if info_row.empty:
+    st.info("Kata kunci topik dominan tidak ditemukan.")
+else:
+    st.dataframe(
+        info_row[[repr_col]].reset_index(drop=True),
+        use_container_width=True,
     )
-else:
-    info_row = topic_info[topic_info[topic_col] == topik_dominan]
-    if info_row.empty:
-        st.info("Info kata kunci untuk topik dominan tidak ditemukan.")
-    else:
-        st.dataframe(
-            info_row[[repr_col]].reset_index(drop=True), use_container_width=True
-        )
 
 # ======================================================
-# CONTOH KOMENTAR TOPIK DOMINAN
-# ======================================================
-st.markdown("### 💬 Contoh Komentar (Topik Dominan)")
-
-contoh = (
-    df_topics[df_topics["topic"] == topik_dominan]["text"]
-    .dropna()
-    .astype(str)
-    .head(5)
-    .tolist()
-)
-if not contoh:
-    st.info("Tidak ada contoh komentar untuk topik ini.")
-else:
-    for i, teks in enumerate(contoh, 1):
-        st.write(f"{i}. {teks}")
-
-# ======================================================
-# DISTRIBUSI TOPIK (TOP 10)
+# DISTRIBUSI TOPIK
 # ======================================================
 st.markdown("### 📊 Distribusi Topik (Top 10)")
 
@@ -447,12 +648,7 @@ topic_counts = df_topics["topic"].value_counts().reset_index()
 topic_counts.columns = ["Topic", "Jumlah"]
 topic_counts["Topic"] = topic_counts["Topic"].astype(int)
 
-# opsional: buang outlier -1 agar chart lebih informatif
-topic_counts_no_outlier = topic_counts[topic_counts["Topic"] != -1].copy()
-if len(topic_counts_no_outlier) > 0:
-    plot_df = topic_counts_no_outlier.head(10)
-else:
-    plot_df = topic_counts.head(10)
+plot_df = topic_counts[topic_counts["Topic"] != -1].head(10)
 
 topic_chart = (
     alt.Chart(plot_df)
@@ -464,26 +660,25 @@ topic_chart = (
     )
     .properties(height=320)
 )
+
 st.altair_chart(topic_chart, use_container_width=True)
 
 # ======================================================
-# DOWNLOAD HASIL BERTOPIC
+# DOWNLOAD HASIL
 # ======================================================
 st.markdown("### ⬇️ Download Hasil BERTopic")
 
-csv_topics = df_topics.to_csv(index=False).encode("utf-8")
 st.download_button(
-    label=f"Download df_topics ({selected_sentiment})",
-    data=csv_topics,
+    f"Download df_topics ({selected_sentiment})",
+    df_topics.to_csv(index=False).encode("utf-8"),
     file_name=f"hasil_bertopic_{selected_sentiment.lower()}.csv",
     mime="text/csv",
     use_container_width=True,
 )
 
-csv_info = topic_info.to_csv(index=False).encode("utf-8")
 st.download_button(
-    label=f"Download topic_info ({selected_sentiment})",
-    data=csv_info,
+    f"Download topic_info ({selected_sentiment})",
+    topic_info.to_csv(index=False).encode("utf-8"),
     file_name=f"topic_info_{selected_sentiment.lower()}.csv",
     mime="text/csv",
     use_container_width=True,
